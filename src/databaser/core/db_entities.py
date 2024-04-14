@@ -12,11 +12,9 @@ from typing import (
     List,
     Optional,
     Set,
-    Tuple,
-    Union,
+    Union, AsyncIterator,
 )
 
-import asyncpg
 from asyncpg.pool import (
     Pool,
 )
@@ -90,7 +88,7 @@ class BaseDatabase(object):
         """
         select_partition_names_list_sql = SQLRepository.get_select_partition_names_list_sql()
 
-        async with self._connection_pool.acquire() as connection:
+        async with self.connection_pool.acquire() as connection:
             partition_names = await connection.fetch(
                 query=select_partition_names_list_sql,
             )
@@ -108,14 +106,14 @@ class BaseDatabase(object):
             excluded_tables=EXCLUDED_TABLES,
         )
 
-        async with self._connection_pool.acquire() as connection:
+        async with self.connection_pool.acquire() as connection:
             table_names = await connection.fetch(
                 query=select_tables_names_list_sql,
             )
 
             self.table_names = [
                 table_name_rec[0]
-                for table_name_rec in table_names
+                for table_name_rec in table_names if table_name_rec[0] != 'storage_data'
             ]
 
     async def execute_raw_sql(
@@ -125,13 +123,10 @@ class BaseDatabase(object):
         """
         Async executing raw sql
         """
-        connection = await asyncpg.connect(self.connection_str)
-
-        try:
+        logger.info(f"prepare execute raw sql {raw_sql[:150]}...{raw_sql[-50:]}")
+        async with self.connection_pool.acquire() as connection:
             await connection.execute(raw_sql)
-        finally:
-            del raw_sql
-            await connection.close()
+        logger.info(f"after execute raw sql {raw_sql[:150]}...{raw_sql[-50:]}")
 
     async def fetch_raw_sql(
         self,
@@ -140,16 +135,33 @@ class BaseDatabase(object):
         """
         Async executing raw sql with fetching result
         """
-        connection = await asyncpg.connect(self.connection_str)
-
-        try:
+        logger.info(f"prepare fetch_raw_sql {raw_sql[:150]}...{raw_sql[-150:]}")
+        async with self.connection_pool.acquire() as connection:
             result = await connection.fetch(raw_sql)
-        finally:
-            await connection.close()
-
-        del raw_sql
-
+        logger.info(f"after fetch_raw_sql {raw_sql[:150]}...{raw_sql[-150:]}")
         return result
+
+    def get_iter(self, sql: str, chunk_size: int) -> AsyncIterator[List[str]]:
+        step = 0
+        LIMIT_OFFSET_SQL_TEMPLATE = """{sql} LIMIT {limit} OFFSET {offset};"""
+
+        async def iterator():
+            nonlocal step
+
+            while True:
+                step_sql = LIMIT_OFFSET_SQL_TEMPLATE.format(
+                    sql=sql.replace(';', ''),
+                    limit=chunk_size,
+                    offset=chunk_size * step
+                )
+                data = await self.fetch_raw_sql(step_sql)
+                if not data:
+                    break
+                data = [i[0] for i in data]
+                yield data
+                step += 1
+
+        return iterator()
 
     def clear_cache(self):
         """
@@ -239,7 +251,7 @@ class DstDatabase(BaseDatabase):
             ),
         )
 
-        async with self._connection_pool.acquire() as connection:
+        async with self.connection_pool.acquire() as connection:
             records = await connection.fetch(
                 query=getting_tables_columns_sql,
             )
@@ -430,7 +442,7 @@ class DBTable(object):
         )
 
         # Pks of table for transferring
-        self.need_transfer_pks = set()
+        self.need_transfer_pks = StorageDataTable()
 
         self.transferred_pks_count = 0
 
@@ -440,7 +452,7 @@ class DBTable(object):
             f'@with_fk="{self.with_fk}" '
             f'@with_key_column="{self.with_key_column}" '
             f'@with_self_fk="{self.with_self_fk}" '
-            f'@need_transfer_pks_count="{len(self.need_transfer_pks)}" >'
+            #f'@need_transfer_pks_count="{len(self.need_transfer_pks)}" >'
         )
 
     def __str__(self):
@@ -478,14 +490,13 @@ class DBTable(object):
     def is_ready_for_transferring(self, is_ready_for_transferring):
         self._is_ready_for_transferring = is_ready_for_transferring
 
-    @property
-    def is_full_prepared(self):
+    async def is_full_prepared(self):
         logger.debug(
             f'table - {self.name} -- count table records {self.full_count} and '
-            f'need transfer pks {len(self.need_transfer_pks)}'
+            f'need transfer pks {await self.need_transfer_pks.len()}'
         )
 
-        if len(self.need_transfer_pks) >= self.full_count - self.inaccuracy_count:  # noqa
+        if await self.need_transfer_pks.len() >= self.full_count - self.inaccuracy_count:  # noqa
             logger.info(f'table {self.name} full transferred')
 
             return True
@@ -630,16 +641,17 @@ class DBTable(object):
 
         return fk_columns
 
-    def update_need_transfer_pks(
+    async def update_need_transfer_pks(
         self,
-        need_transfer_pks: Iterable[Union[int, str]],
+        need_transfer_pks: Union[Iterable[Union[int, str]], 'StorageDataTable'],
     ):
         """
         Updating table need transfer pks
         """
-        self.need_transfer_pks.update(need_transfer_pks)
-
-        del need_transfer_pks
+        if isinstance(need_transfer_pks, StorageDataTable):
+            await self.need_transfer_pks.add_storage_data(need_transfer_pks)
+        else:
+            await self.need_transfer_pks.insert(need_transfer_pks)
 
     async def append_column(
         self,
@@ -854,3 +866,115 @@ class DBColumn(object):
 
     async def add_constraint_type(self, constraint_type):
         self.constraint_type.append(constraint_type)
+
+
+##############
+
+
+CREATE_TABLE_SQL = """
+    CREATE TABLE storage_data (
+        group_id INTEGER,
+        data VARCHAR(255),
+        CONSTRAINT UC_VALUE UNIQUE (group_id,data)
+);
+
+CREATE INDEX group_idx ON storage_data (group_id);
+"""
+
+DROP_TABLE_SQL = """DROP TABLE IF EXISTS storage_data;"""
+
+INSERT_DATA_SQL_TEMPLATE = """
+    INSERT INTO storage_data (group_id, data)
+    VALUES {values}
+    ON CONFLICT DO NOTHING;
+"""
+
+DELETE_DATA_SQL_TEMPLATE = """
+    DELETE FROM storage_data
+    WHERE group_id = '{group}';
+"""
+
+IS_EXIST_DATA_SQL_TEMPLATE = """SELECT EXISTS(SELECT * FROM storage_data WHERE group_id = '{group}') as exist;"""
+
+ALL_DATA_SQL_TEMPLATE = """SELECT data FROM storage_data WHERE group_id = '{group}' ORDER BY data;"""
+
+COUNT_DATA_SQL_TEMPLATE = """SELECT count(*) FROM storage_data WHERE group_id = '{group}';"""
+
+DIFFERENCE_DATA_SQL_TEMPLATE = """
+    SELECT data FROM storage_data WHERE group_id = '{group1}' AND data not in (
+        SELECT data FROM storage_data WHERE group_id = '{group2}'
+    ) ORDER BY data;
+"""
+
+COUNT_SQL_RESULT_TEMPLATE = """SELECT count(*) from {sql};"""
+
+
+class StorageDataTable:
+    CHUNK_SIZE = 30000
+    _last_group_number = 0
+    _dst_db: Optional[DstDatabase] = None
+
+    def __init__(self):
+        StorageDataTable._last_group_number += 1
+        self._have_value = False
+        self._group = StorageDataTable._last_group_number
+
+    @staticmethod
+    async def init_table(dst_db: DstDatabase):
+        StorageDataTable._dst_db = dst_db
+        await StorageDataTable.drop_table()
+        await StorageDataTable._dst_db.execute_raw_sql(CREATE_TABLE_SQL)
+
+    @staticmethod
+    async def drop_table():
+        await StorageDataTable._dst_db.execute_raw_sql(DROP_TABLE_SQL)
+
+    async def delete(self):
+        delete_data_sql = DELETE_DATA_SQL_TEMPLATE.format(group=self._group)
+        await StorageDataTable._dst_db.execute_raw_sql(delete_data_sql)
+
+    def __aiter__(self) -> AsyncIterator[List[str]]:
+        all_sql = ALL_DATA_SQL_TEMPLATE.format(group=self._group)
+        return self._dst_db.get_iter(all_sql, self.CHUNK_SIZE)
+
+    async def insert(self, data: Iterable[Union[int, str]]):
+        if not data:
+            return
+
+        insert_data_sql = INSERT_DATA_SQL_TEMPLATE.format(
+            values=', '.join([str((self._group, i)) for i in data])
+        )
+        await StorageDataTable._dst_db.execute_raw_sql(insert_data_sql)
+
+    async def add_storage_data(self, storage_data: 'StorageDataTable'):
+        async for chunk in storage_data:
+            await self.insert(chunk)
+
+    async def is_not_empty(self) -> bool:
+        if not self._have_value:
+            is_exist_sql = IS_EXIST_DATA_SQL_TEMPLATE.format(group=self._group)
+
+            result = await StorageDataTable._dst_db.fetch_raw_sql(is_exist_sql)
+
+            self._have_value = result[0][0]
+
+        return self._have_value
+
+    async def all(self) -> list[str]:
+        all_data_sql = ALL_DATA_SQL_TEMPLATE.format(group=self._group)
+
+        result = await StorageDataTable._dst_db.fetch_raw_sql(all_data_sql)
+
+        return [i[0] for i in result]
+
+    async def len(self) -> int:
+        count_data_sql = COUNT_DATA_SQL_TEMPLATE.format(group=self._group)
+
+        result = await StorageDataTable._dst_db.fetch_raw_sql(count_data_sql)
+
+        return result[0][0]
+
+    def iter_difference(self, other: 'StorageDataTable') -> AsyncIterator[List[str]]:
+        data_sql = DIFFERENCE_DATA_SQL_TEMPLATE.format(group1=self._group, group2=other._group)
+
+        return self._dst_db.get_iter(data_sql, self.CHUNK_SIZE)

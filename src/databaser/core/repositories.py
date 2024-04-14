@@ -26,7 +26,7 @@ from databaser.settings import (
 
 
 class SQLRepository:
-    CHUNK_SIZE = 60000
+    CHUNK_SIZE = 30000
 
     CREATE_FDW_EXTENSION_SQL_TEMPLATE = (
         'CREATE EXTENSION postgres_fdw;'
@@ -168,6 +168,7 @@ class SQLRepository:
         select {selection_params_commas}
         from "tmp_src_schema"."{table_name}" 
         where {pk_condition_sql}
+        on conflict do nothing
         returning "{primary_key}";"""
 
     CONTENT_TYPE_TABLE_SQL_TEMPLATE = """
@@ -600,7 +601,7 @@ class SQLRepository:
             )
         else:
             ids_str = ", ".join(
-                map(lambda pk: f"''{pk}''", ids)
+                map(lambda pk: f"'{pk}'", ids)
             )
 
         return ids_str

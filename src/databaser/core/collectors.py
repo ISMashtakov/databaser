@@ -16,12 +16,13 @@ from typing import (
 )
 
 import asyncpg
+from asyncpg import DatetimeFieldOverflowError
 
 from databaser.core.db_entities import (
     DBColumn,
     DBTable,
     DstDatabase,
-    SrcDatabase,
+    SrcDatabase, StorageDataTable,
 )
 from databaser.core.enums import (
     StagesEnum,
@@ -29,7 +30,6 @@ from databaser.core.enums import (
 from databaser.core.helpers import (
     logger,
     make_chunks,
-    make_str_from_iterable,
     topological_sort,
 )
 from databaser.core.loggers import (
@@ -39,6 +39,7 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.tsts import get_acquire
 from databaser.settings import (
     EXCLUDED_TABLES,
     FULL_TRANSFER_TABLES,
@@ -48,7 +49,7 @@ from databaser.settings import (
 
 
 class BaseCollector(metaclass=ABCMeta):
-    CHUNK_SIZE = 60000
+    CHUNK_SIZE = 30000
 
     # Hashes of unique SQL-queries uses for excluding duplicate of queries
     QUERY_HASHES = set()
@@ -68,31 +69,20 @@ class BaseCollector(metaclass=ABCMeta):
     async def _get_table_column_values_part(
         self,
         table_column_values_sql: str,
-        table_column_values: List[Union[str, int]],
+        table_column_values: StorageDataTable,
     ):
         if table_column_values_sql:
             logger.debug(table_column_values_sql)
+            try:
+                async for data in self._src_database.get_iter(table_column_values_sql,
+                                                              chunk_size=BaseCollector.CHUNK_SIZE):
+                    await table_column_values.insert(data)
 
-            async with self._src_database.connection_pool.acquire() as connection:  # noqa
-                try:
-                    table_column_values_part = await connection.fetch(table_column_values_sql)  # noqa
-                except (asyncpg.PostgresSyntaxError, asyncpg.UndefinedColumnError) as e:
-                    logger.warning(
-                        f"{str(e)} --- {table_column_values_sql} --- "
-                        f"_get_table_column_values_part"
-                    )
-                    table_column_values_part = []
-
-                filtered_table_column_values_part = [
-                    record[0]
-                    for record in table_column_values_part if
-                    record[0] is not None
-                ]
-
-                table_column_values.extend(filtered_table_column_values_part)
-
-                del table_column_values_part
-                del table_column_values_sql
+            except (asyncpg.PostgresSyntaxError, asyncpg.UndefinedColumnError) as e:
+                logger.warning(
+                    f"{str(e)} --- {table_column_values_sql[:100]} --- "
+                    f"_get_table_column_values_part"
+                )
 
     async def _get_table_column_values(
         self,
@@ -101,15 +91,15 @@ class BaseCollector(metaclass=ABCMeta):
         primary_key_values: Iterable[Union[int, str]] = (),
         where_conditions_columns: Optional[Dict[str, Iterable[Union[int, str]]]] = None,  # noqa
         is_revert=False,
-    ) -> Set[Union[str, int]]:
+    ) -> StorageDataTable:
         # если таблица находится в исключенных, то ее записи не нужно
         # импортировать
         try:
             if column.constraint_table.name in EXCLUDED_TABLES:
-                return set()
+                return StorageDataTable()
         except AttributeError as e:
             logger.warning(f"{str(e)} --- _get_table_column_values")
-            return set()
+            return StorageDataTable()
 
         # формирование запроса на получения идентификаторов записей
         # внешней таблицы
@@ -121,26 +111,24 @@ class BaseCollector(metaclass=ABCMeta):
             where_conditions_columns=where_conditions_columns,
             is_revert=is_revert,
         )
-        table_column_values = []
+
+        table_column_values = StorageDataTable()
 
         for table_column_values_sql in table_column_values_sql_list:
             sql_query_hash = hash(table_column_values_sql)
 
             if sql_query_hash not in self.__class__.QUERY_HASHES:
                 BaseCollector.QUERY_HASHES.add(sql_query_hash)
+                try:
+                    await self._get_table_column_values_part(
+                        table_column_values_sql=table_column_values_sql,
+                        table_column_values=table_column_values,
+                    )
+                except DatetimeFieldOverflowError as e:
+                    logger.warning(f"Failed to get table column value {table.name}: {e}")
+                    break
 
-                await self._get_table_column_values_part(
-                    table_column_values_sql=table_column_values_sql,
-                    table_column_values=table_column_values,
-                )
-
-        del table_column_values_sql_list[:]
-
-        unique_table_column_values = set(table_column_values)
-
-        del table_column_values[:]
-
-        return unique_table_column_values
+        return table_column_values
 
     @abstractmethod
     def collect(self):
@@ -159,7 +147,7 @@ class KeyTableCollector(BaseCollector):
 
         key_table = self._dst_database.tables[KEY_TABLE_NAME]
 
-        key_table.update_need_transfer_pks(
+        await key_table.update_need_transfer_pks(
             need_transfer_pks=self._key_column_values,
         )
 
@@ -194,12 +182,11 @@ class FullTransferCollector(BaseCollector):
 
         table.is_checked = True
 
-        if need_transfer_pks:
-            table.update_need_transfer_pks(
-                need_transfer_pks=need_transfer_pks,
-            )
+        await table.update_need_transfer_pks(
+            need_transfer_pks=need_transfer_pks,
+        )
 
-        del need_transfer_pks
+        await need_transfer_pks.delete()
 
         logger.info(
             f'finished preparing full transfer table "{table.name}"'
@@ -212,15 +199,8 @@ class FullTransferCollector(BaseCollector):
 
         tables = [table for table in self._dst_database.tables.values() if table.name in FULL_TRANSFER_TABLES]
 
-        coroutines = [
-            asyncio.create_task(
-                self._prepare_full_transfer_table(table)
-            )
-            for table in tables
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
+        for table in tables:
+            await self._prepare_full_transfer_table(table)
 
         for table in tables:
             if table.is_checked:
@@ -259,7 +239,7 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
         else:
             need_transfer_pks = (
                 need_transfer_pks_chunk if
-                not table.is_full_prepared else
+                not await table.is_full_prepared() else
                 ()
             )
 
@@ -272,45 +252,24 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
         # если найдены значения внешних ключей отличающиеся от null, то
         # записи из внешней талицы с этими идентификаторами должны быть
         # импортированы
-        if foreign_table_pks:
-            logger.debug(
-                f"table - {table.name}, column - {column.name} - reversed "
-                f"collecting of fk_ids ----- {foreign_table.name}"
+
+        # если есть разница между предполагаемыми записями для импорта
+        # и уже выбранными ранее, то разницу нужно импортировать
+        async for chunk in foreign_table_pks.iter_difference(foreign_table.need_transfer_pks):
+            await foreign_table.update_need_transfer_pks(chunk)
+            await self._direct_recursively_preparing_table(
+                            table=foreign_table,
+                            need_transfer_pks=chunk,
+                            stack_tables=stack_tables
             )
 
-            foreign_table_pks_difference = foreign_table_pks.difference(
-                foreign_table.need_transfer_pks
-            )
-
-            # если есть разница между предполагаемыми записями для импорта
-            # и уже выбранными ранее, то разницу нужно импортировать
-            if foreign_table_pks_difference:
-                foreign_table.update_need_transfer_pks(
-                    need_transfer_pks=foreign_table_pks_difference,
-                )
-
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            self._direct_recursively_preparing_table(
-                                table=foreign_table,
-                                need_transfer_pks=foreign_table_pks_difference,
-                                stack_tables=stack_tables,
-                            )
-                        ),
-                    ]
-                )
-
-            del foreign_table_pks_difference
-
-        del foreign_table_pks
-        del need_transfer_pks_chunk
+        await foreign_table_pks.delete()
 
     async def _direct_recursively_preparing_foreign_table(
         self,
         table: DBTable,
         column: DBColumn,
-        need_transfer_pks: Iterable[int],
+        need_transfer_pks: Iterable[Union[int, str]],
         stack_tables: Set[DBTable],
     ):
         """
@@ -322,58 +281,18 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             is_list=True,
         )
 
-        coroutines = [
-            asyncio.create_task(
-                self._direct_recursively_preparing_foreign_table_chunk(
+        for need_transfer_pks_chunk in need_transfer_pks_chunks:
+            await self._direct_recursively_preparing_foreign_table_chunk(
                     table=table,
                     column=column,
                     need_transfer_pks_chunk=need_transfer_pks_chunk,
                     stack_tables=stack_tables,
                 )
-            )
-            for need_transfer_pks_chunk in need_transfer_pks_chunks
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
-
-    async def _direct_recursively_preparing_table_chunk(
-        self,
-        table: DBTable,
-        need_transfer_pks_chunk: List[int],
-        stack_tables: Optional[Set[DBTable]] = None,
-    ):
-        """
-        Recursively preparing table
-        """
-
-        logger.debug(make_str_from_iterable([t.name for t in stack_tables]))
-
-        coroutines = [
-            asyncio.create_task(
-                self._direct_recursively_preparing_foreign_table(
-                    table=table,
-                    column=column,
-                    need_transfer_pks=need_transfer_pks_chunk,
-                    stack_tables=stack_tables,
-                )
-            )
-            for column in table.not_self_fk_columns if
-            not (
-                column.constraint_table.with_key_column or
-                column.constraint_table in stack_tables
-            )
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
-
-        del need_transfer_pks_chunk
 
     async def _direct_recursively_preparing_table(
         self,
         table: DBTable,
-        need_transfer_pks: Iterable[int],
+        need_transfer_pks: Iterable[Union[int, str]],
         stack_tables: Optional[Set[DBTable]] = None,
     ):
         """
@@ -386,44 +305,28 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             return
 
         stack_tables.add(table)
-
-        coroutines = [
-            asyncio.create_task(
-                self._direct_recursively_preparing_foreign_table(
+        print(f"update _direct_recursively_preparing_table {table.name}")
+        for column in table.not_self_fk_columns:
+            if not (
+                        column.constraint_table.with_key_column or
+                        column.constraint_table in stack_tables or
+                        column.constraint_table.is_ready_for_transferring
+            ):
+                await self._direct_recursively_preparing_foreign_table(
                     table=table,
                     column=column,
                     need_transfer_pks=need_transfer_pks,
                     stack_tables=stack_tables,
                 )
-            )
-            for column in table.not_self_fk_columns if
-            not (
-                column.constraint_table.with_key_column or
-                column.constraint_table in stack_tables or
-                column.constraint_table.is_ready_for_transferring
-            )
-        ]
 
-        coroutines_hierarchy = [
-            asyncio.create_task(
-                self._direct_recursively_preparing_foreign_table(
+        for column in table.self_fk_columns:
+            if not column.constraint_table.is_ready_for_transferring:
+                await self._direct_recursively_preparing_foreign_table(
                     table=table,
                     column=column,
                     need_transfer_pks=need_transfer_pks,
                     stack_tables=stack_tables - {table},
                 )
-            )
-            for column in table.self_fk_columns if
-            not (
-                column.constraint_table.is_ready_for_transferring
-            )
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
-
-        if coroutines_hierarchy:
-            await asyncio.wait(coroutines_hierarchy)
 
         table.is_checked = True
 
@@ -449,13 +352,12 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             is_revert=True,
         )
 
-        if revert_table_pks:
-            revert_table.update_need_transfer_pks(
-                need_transfer_pks=revert_table_pks,
-            )
+        await revert_table.update_need_transfer_pks(
+            need_transfer_pks=revert_table_pks,
+        )
 
         del need_transfer_pks_chunk
-        del revert_table_pks
+        await revert_table_pks.delete()
 
     async def _revert_recursively_preparing_revert_table_column(
         self,
@@ -472,19 +374,12 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             is_list=True,
         )
 
-        coroutines = [
-            asyncio.create_task(
-                self._revert_recursively_preparing_revert_table_column_chunk(
+        for need_transfer_pks_chunk in need_transfer_pks_chunks:
+            await self._revert_recursively_preparing_revert_table_column_chunk(
                     revert_table=revert_table,
                     revert_column=revert_column,
                     need_transfer_pks_chunk=need_transfer_pks_chunk,
                 )
-            )
-            for need_transfer_pks_chunk in need_transfer_pks_chunks
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
 
     async def _revert_recursively_preparing_revert_table(
         self,
@@ -497,22 +392,15 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
         Recursively preparing revert table
         """
         if need_transfer_pks:
-            coroutines = [
-                asyncio.create_task(
-                    self._revert_recursively_preparing_revert_table_column(
+            for revert_column in revert_columns:
+                if revert_column in revert_table.highest_priority_fk_columns:
+                    await self._revert_recursively_preparing_revert_table_column(
                         revert_table=revert_table,
                         revert_column=revert_column,
                         need_transfer_pks=need_transfer_pks,
                     )
-                )
-                for revert_column in revert_columns if
-                revert_column in revert_table.highest_priority_fk_columns
-            ]
 
-            if coroutines:
-                await asyncio.wait(coroutines)
-
-            if revert_table.need_transfer_pks:
+            if await revert_table.need_transfer_pks.is_not_empty():
                 stack_tables_copy = copy(stack_tables)
 
                 await self._revert_recursively_preparing_table(
@@ -522,7 +410,7 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
 
                 await self._direct_recursively_preparing_table(
                     table=revert_table,
-                    need_transfer_pks=revert_table.need_transfer_pks,
+                    need_transfer_pks=await revert_table.need_transfer_pks.all(),
                     stack_tables=stack_tables_copy,
                 )
 
@@ -544,27 +432,20 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             return
 
         stack_tables.add(table)
-
-        coroutines = [
-            asyncio.create_task(
-                self._revert_recursively_preparing_revert_table(
-                    revert_table=revert_table,
-                    revert_columns=revert_columns,
-                    need_transfer_pks=table.need_transfer_pks,
-                    stack_tables=stack_tables,
-                )
-            )
-            for revert_table, revert_columns in table.revert_foreign_tables.items() if  # noqa
-            not (
+        print(f"updated _revert_recursively_preparing_table {table.name}")
+        for revert_table, revert_columns in table.revert_foreign_tables.items():
+            if not (
                 revert_table.with_key_column or
                 revert_table == table or
                 revert_table in stack_tables or
                 revert_table.is_ready_for_transferring
-            )
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
+            ):
+                await self._revert_recursively_preparing_revert_table(
+                    revert_table=revert_table,
+                    revert_columns=revert_columns,
+                    need_transfer_pks=await table.need_transfer_pks.all(),
+                    stack_tables=stack_tables,
+                )
 
         table.is_checked = True
 
@@ -586,36 +467,25 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             table=table,
             column=table.primary_key,
         )
-
+        print(f"count {await need_transfer_pks.len()}")
         table.is_checked = True
 
-        if need_transfer_pks:
-            table.update_need_transfer_pks(
+        if await need_transfer_pks.is_not_empty():
+            await table.update_need_transfer_pks(
                 need_transfer_pks=need_transfer_pks,
             )
+            print("updated")
+            async for chunk in need_transfer_pks:
+                print("chunk")
+                await self._direct_recursively_preparing_table(
+                                table=table,
+                                need_transfer_pks=chunk,
+                            )
 
-            await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        self._direct_recursively_preparing_table(
-                            table=table,
-                            need_transfer_pks=need_transfer_pks,
-                        )
-                    ),
-                ]
-            )
+            print("updated recursive")
+            await self._revert_recursively_preparing_table(table=table)
 
-            await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        self._revert_recursively_preparing_table(
-                            table=table,
-                        )
-                    ),
-                ]
-            )
-
-        del need_transfer_pks
+        await need_transfer_pks.delete()
 
         logger.info(
             f'finished preparing table with key column "{table.name}"'
@@ -625,15 +495,8 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
         logger.info(
             'start preparing tables with key column and their siblings..'
         )
-        coroutines = [
-            asyncio.create_task(
-                self._prepare_tables_with_key_column(table)
-            )
-            for table in self._dst_database.tables_with_key_column
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
+        for table in self._dst_database.tables_with_key_column:
+            await self._prepare_tables_with_key_column(table)
 
         for dst_table in self._dst_database.tables.values():
             if dst_table.is_checked:
@@ -659,8 +522,8 @@ class SortedByDependencyTablesCollector(BaseCollector):
         Get revert table column values
         """
         revert_table_pks = (
-            revert_table.need_transfer_pks if
-            not revert_table.is_full_prepared else
+            await revert_table.need_transfer_pks.all() if
+            not await revert_table.is_full_prepared() else
             ()
         )
 
@@ -671,12 +534,11 @@ class SortedByDependencyTablesCollector(BaseCollector):
             is_revert=True,
         )
 
-        if revert_table_column_values:
-            table.update_need_transfer_pks(
-                need_transfer_pks=revert_table_column_values,
-            )
+        await table.update_need_transfer_pks(
+            need_transfer_pks=revert_table_column_values,
+        )
 
-        del revert_table_column_values
+        await revert_table_column_values.delete()
 
     async def _prepare_revert_table(
         self,
@@ -697,19 +559,12 @@ class SortedByDependencyTablesCollector(BaseCollector):
 
         if revert_table.need_transfer_pks:
 
-            coroutines = [
-                asyncio.create_task(
-                    self._get_revert_table_column_values(
+            for revert_column in revert_columns:
+                await self._get_revert_table_column_values(
                         table=table,
                         revert_table=revert_table,
                         revert_column=revert_column,
-                    )
                 )
-                for revert_column in revert_columns
-            ]
-
-            if coroutines:
-                await asyncio.wait(coroutines)
 
     async def _prepare_unready_table(
         self,
@@ -734,10 +589,10 @@ class SortedByDependencyTablesCollector(BaseCollector):
                 fk_column.constraint_table.name
             ]
 
-            if fk_table.need_transfer_pks:
-                if not fk_table.is_full_prepared:
+            if await fk_table.need_transfer_pks.is_not_empty():
+                if not await fk_table.is_full_prepared():
                     where_conditions_columns[fk_column.name] = (
-                        fk_table.need_transfer_pks
+                        await fk_table.need_transfer_pks.all()
                     )
                 else:
                     with_full_transferred_table = True
@@ -758,37 +613,30 @@ class SortedByDependencyTablesCollector(BaseCollector):
         if (
             fk_columns and
             where_conditions_columns and
-            not table_pks
+            not await table_pks.is_not_empty()
         ):
             return
 
-        table.update_need_transfer_pks(
+        await table.update_need_transfer_pks(
             need_transfer_pks=table_pks,
         )
 
         logger.debug(
             f'table "{table.name}" need transfer pks - '
-            f'{len(table.need_transfer_pks)}'
+            f'{await table.need_transfer_pks.len()}'
         )
 
-        del table_pks
+        await table_pks.delete()
 
         # обход таблиц ссылающихся на текущую таблицу
         logger.debug('prepare revert tables')
 
-        coroutines = [
-            asyncio.create_task(
-                self._prepare_revert_table(
+        for revert_table, revert_columns in table.revert_foreign_tables.items():
+            await self._prepare_revert_table(
                     table=table,
                     revert_table=revert_table,
                     revert_columns=revert_columns,
-                )
             )
-            for revert_table, revert_columns in table.revert_foreign_tables.items()  # noqa
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
 
         if not table.need_transfer_pks:
             all_records = await self._get_table_column_values(
@@ -796,11 +644,11 @@ class SortedByDependencyTablesCollector(BaseCollector):
                 column=table.primary_key,
             )
 
-            table.update_need_transfer_pks(
+            await table.update_need_transfer_pks(
                 need_transfer_pks=all_records,
             )
 
-            del all_records
+            await all_records.delete()
 
         table.is_ready_for_transferring = True
 
@@ -945,7 +793,7 @@ class GenericTablesCollector(BaseCollector):
         logger.info('prepare content type generic data')
 
         where_conditions = {
-            'object_id': rel_table.need_transfer_pks,
+            'object_id': await rel_table.need_transfer_pks.all(),
             'content_type_id': [self.content_type_table[rel_table.name]],
         }
 
@@ -956,15 +804,14 @@ class GenericTablesCollector(BaseCollector):
         )
 
         logger.info(
-            f'{target_table.name} need transfer pks {len(need_transfer_pks)}'
+            f'{target_table.name} need transfer pks {await need_transfer_pks.len()}'
         )
 
-        target_table.update_need_transfer_pks(
+        await target_table.update_need_transfer_pks(
             need_transfer_pks=need_transfer_pks,
         )
 
-        del where_conditions
-        del need_transfer_pks
+        await need_transfer_pks.delete()
 
     async def _prepare_generic_table_data(self, target_table: DBTable):
         """
@@ -972,17 +819,10 @@ class GenericTablesCollector(BaseCollector):
         """
         logger.info(f"prepare generic table data {target_table.name}")
 
-        coroutines = [
-            asyncio.create_task(
-                self._prepare_content_type_generic_data(
-                    target_table=target_table, rel_table_name=rel_table_name
-                )
+        for rel_table_name in self.content_type_table.keys():
+            await self._prepare_content_type_generic_data(
+                target_table=target_table, rel_table_name=rel_table_name
             )
-            for rel_table_name in self.content_type_table.keys()
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
 
     async def _collect_generic_tables_records_ids(self):
         """
@@ -1001,17 +841,10 @@ class GenericTablesCollector(BaseCollector):
 
         generic_table_names = set(TABLES_WITH_GENERIC_FOREIGN_KEY).difference(EXCLUDED_TABLES)
 
-        coroutines = [
-            asyncio.create_task(
-                self._prepare_generic_table_data(
-                    self._dst_database.tables.get(table_name)
-                )
+        for table_name in filter(None, generic_table_names):
+            await self._prepare_generic_table_data(
+                self._dst_database.tables.get(table_name)
             )
-            for table_name in filter(None, generic_table_names)
-        ]
-
-        if coroutines:
-            await asyncio.wait(coroutines)
 
         logger.info("finish collecting")
 
@@ -1022,12 +855,6 @@ class GenericTablesCollector(BaseCollector):
             self._statistic_manager,
             StagesEnum.COLLECT_GENERIC_TABLES_RECORDS_IDS
         ):
-            await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        self._collect_generic_tables_records_ids()
-                    ),
-                ]
-            )
+            await self._collect_generic_tables_records_ids()
 
         logger.info('preparing generic tables finished.')

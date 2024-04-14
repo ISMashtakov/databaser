@@ -11,6 +11,7 @@ from databaser.core.db_entities import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.tsts import get_acquire
 
 
 class PostgresFDWExtensionWrapper:
@@ -30,7 +31,7 @@ class PostgresFDWExtensionWrapper:
 
     async def enable(self):
         """
-        Активация FWD и подготовка СУБД для работы с ним
+        Активация FDW и подготовка СУБД для работы с ним
         """
         create_fdw_extension_sql = SQLRepository.get_create_fdw_extension_sql()
 

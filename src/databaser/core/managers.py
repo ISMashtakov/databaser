@@ -28,7 +28,7 @@ from databaser.core.collectors import (
 from databaser.core.db_entities import (
     DBTable,
     DstDatabase,
-    SrcDatabase,
+    SrcDatabase, StorageDataTable,
 )
 from databaser.core.enums import (
     StagesEnum,
@@ -173,18 +173,11 @@ class DatabaserManager:
         )
 
         if hierarchy_column:
-            coroutines = [
-                asyncio.create_task(
-                    self._get_key_table_parents_values(
+            for key_column_value in copy(self._key_column_values):
+                await self._get_key_table_parents_values(
                         key_table_primary_key_name=key_table.primary_key.name,
                         key_table_primary_key_value=key_column_value,
                     )
-                )
-                for key_column_value in copy(self._key_column_values)
-            ]
-
-            if coroutines:
-                await asyncio.wait(coroutines)
 
         logger.info(
             f"transferring enterprises - "
@@ -197,7 +190,8 @@ class DatabaserManager:
         """
         async with self._src_database.connection_pool.acquire() as connection:
             table = self._dst_database.tables[table_name]
-
+            if table.primary_key is None:
+                raise UndefinedFunctionError
             try:
                 count_table_records_sql = (
                     SQLRepository.get_count_table_records(
@@ -254,16 +248,27 @@ class DatabaserManager:
         """
         async with asyncpg.create_pool(
             self._dst_database.connection_str,
-            min_size=30,
-            max_size=40,
+            min_size=1,
+            max_size=5,
         ) as dst_pool:
             async with asyncpg.create_pool(
                 self._src_database.connection_str,
-                min_size=30,
-                max_size=40,
+                min_size=1,
+                max_size=15,
             ) as src_pool:
                 self._src_database.connection_pool = src_pool
                 self._dst_database.connection_pool = dst_pool
+                await StorageDataTable.init_table(self._dst_database)
+
+                # a = StorageDataTable()
+                # await a.insert([1,2,3,4,5,6,7,8,9,19])
+                # b = StorageDataTable()
+                # await b.insert([2,3,4,5,11,23])
+                #
+                # async for i in a.iter_difference(b):
+                #     print(i)
+                #
+                # return
 
                 await self._src_database.prepare_table_names()
 
@@ -277,21 +282,9 @@ class DatabaserManager:
                     dst_database=self._dst_database,
                     dst_pool=dst_pool,
                 )
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            fdw_wrapper.disable()
-                        ),
-                    ]
-                )
+                await fdw_wrapper.disable()
 
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            self._dst_database.prepare_partition_names()
-                        ),
-                    ]
-                )
+                await self._dst_database.prepare_partition_names()
 
                 if self._dst_database.partition_names:
                     logger.info(f'dst_database partitions - {", ".join(self._dst_database.partition_names)}')
@@ -305,26 +298,15 @@ class DatabaserManager:
 
                 await self._dst_database.disable_triggers()
 
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            self._build_key_column_values_hierarchical_structure()  # noqa
-                        ),
-                    ]
-                )
+                await self._build_key_column_values_hierarchical_structure()  # noqa
+
                 async with statistic_indexer(
                     self._statistic_manager,
                     StagesEnum.TRUNCATE_DST_DB_TABLES,
                 ):
                     await self._dst_database.truncate_tables()
 
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            fdw_wrapper.enable()
-                        ),
-                    ]
-                )
+                await fdw_wrapper.enable()
 
                 async with statistic_indexer(
                     self._statistic_manager,
@@ -338,13 +320,8 @@ class DatabaserManager:
                     statistic_manager=self._statistic_manager,
                     key_column_values=self._key_column_values,
                 )
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            collector_manager.manage()
-                        ),
-                    ]
-                )
+
+                await collector_manager.manage()
 
                 transporter = Transporter(
                     dst_database=self._dst_database,
@@ -357,26 +334,15 @@ class DatabaserManager:
                     self._statistic_manager,
                     StagesEnum.PREPARING_AND_TRANSFERRING_DATA,
                 ):
-                    await asyncio.wait(
-                        [
-                            asyncio.create_task(
-                                transporter.transfer()
-                            ),
-                        ]
-                    )
+                    await transporter.transfer()
 
                 await self._dst_database.enable_triggers()
 
-                await asyncio.wait(
-                    [
-                        asyncio.create_task(
-                            fdw_wrapper.disable()
-                        ),
-                    ]
-                )
+                await fdw_wrapper.disable()
 
                 self._statistic_manager.print_stages_indications()
-                self._statistic_manager.print_records_transfer_statistic()
+                await self._statistic_manager.print_records_transfer_statistic()
+                await StorageDataTable.drop_table()
 
                 if TEST_MODE:
                     validator_manager = ValidatorManager(
@@ -431,6 +397,7 @@ class CollectorManager:
 
     async def manage(self):
         for collector_class in self.collectors_classes:
+            print(f"start {collector_class.__name__}")
             collector = collector_class(
                 src_database=self._src_database,
                 dst_database=self._dst_database,

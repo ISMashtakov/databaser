@@ -10,7 +10,7 @@ from asyncpg import (
     NumericValueOutOfRangeError,
     PostgresError,
     PostgresSyntaxError,
-    UndefinedColumnError,
+    UndefinedColumnError, Connection,
 )
 
 from databaser.core.db_entities import (
@@ -32,6 +32,7 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.tsts import get_acquire
 
 
 class Transporter:
@@ -39,7 +40,7 @@ class Transporter:
     Класс комплексной транспортировки, который использует принципы обхода по
     внешним ключам и по таблицам с обратной связью
     """
-    CHUNK_SIZE = 70000
+    CHUNK_SIZE = 30000
 
     def __init__(
         self,
@@ -59,21 +60,19 @@ class Transporter:
 
         self.content_type_table = {}
 
-    async def _transfer_table_data(self, table):
+    async def _transfer_table_data(self, table: DBTable):
         """
         Перенос данных таблицы
         """
         logger.info(
             f"start transferring table \"{table.name}\", "
-            f"need to import - {len(table.need_transfer_pks)}"
+            f"need to import - {await table.need_transfer_pks.len()}"
         )
+        if table.primary_key is None:
+            logger.warning(f"table {table.name} has no primary key")
+            return
 
-        need_import_ids_chunks = make_chunks(
-            iterable=table.need_transfer_pks,
-            size=self.CHUNK_SIZE,
-        )
-
-        for need_import_ids_chunk in need_import_ids_chunks:
+        async for need_import_ids_chunk in table.need_transfer_pks:
             await self._transfer_chunk_table_data(
                 table=table,
                 need_import_ids_chunk=need_import_ids_chunk,
@@ -117,19 +116,15 @@ class Transporter:
         if transferred_ids:
             table.transferred_pks_count += len(transferred_ids)
 
-        del transfer_sql
-        del transferred_ids
-
     async def _transfer_collecting_data(self):
         """
         Физический импорт данных в целевую БД из БД-донора
         """
         logger.info("start transferring data to target db...")
 
-        need_imported_tables = filter(
-            lambda table: table.need_transfer_pks,
-            self._dst_database.tables.values(),
-        )
+        need_imported_tables = [
+            table for table in self._dst_database.tables.values() if await table.need_transfer_pks.is_not_empty()
+        ]
 
         coroutines = [
             self._transfer_table_data(table)
@@ -157,22 +152,10 @@ class Transporter:
             self._statistic_manager,
             StagesEnum.TRANSFERRING_COLLECTED_DATA
         ):
-            await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        self._transfer_collecting_data()
-                    ),
-                ]
-            )
+            await  self._transfer_collecting_data()
 
         async with statistic_indexer(
             self._statistic_manager,
             StagesEnum.UPDATE_SEQUENCES
         ):
-            await asyncio.wait(
-                [
-                    asyncio.create_task(
-                        self._update_sequences()
-                    ),
-                ]
-            )
+            await self._update_sequences()

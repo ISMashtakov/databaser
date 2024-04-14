@@ -32,6 +32,7 @@ from databaser.core.helpers import (
 from databaser.core.loggers import (
     StatisticManager,
 )
+from databaser.core.tsts import get_acquire
 
 
 class BaseValidator(metaclass=ABCMeta):
