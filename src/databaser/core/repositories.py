@@ -26,7 +26,7 @@ from databaser.settings import (
 
 
 class SQLRepository:
-    CHUNK_SIZE = 30000
+    CHUNK_SIZE = 3000000
 
     CREATE_FDW_EXTENSION_SQL_TEMPLATE = (
         'CREATE EXTENSION postgres_fdw;'

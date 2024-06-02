@@ -9,7 +9,6 @@ from copy import (
 from typing import (
     Dict,
     Iterable,
-    List,
     Optional,
     Set,
     Union,
@@ -22,7 +21,7 @@ from databaser.core.db_entities import (
     DBColumn,
     DBTable,
     DstDatabase,
-    SrcDatabase, StorageDataTable,
+    SrcDatabase,
 )
 from databaser.core.enums import (
     StagesEnum,
@@ -39,6 +38,7 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.storages import AbstractStorage, create_storage
 from databaser.settings import (
     EXCLUDED_TABLES,
     FULL_TRANSFER_TABLES,
@@ -48,7 +48,7 @@ from databaser.settings import (
 
 
 class BaseCollector(metaclass=ABCMeta):
-    CHUNK_SIZE = 30000
+    CHUNK_SIZE = 3000000
 
     # Hashes of unique SQL-queries uses for excluding duplicate of queries
     QUERY_HASHES = set()
@@ -68,14 +68,14 @@ class BaseCollector(metaclass=ABCMeta):
     async def _get_table_column_values_part(
         self,
         table_column_values_sql: str,
-        table_column_values: StorageDataTable,
+        table_column_values: AbstractStorage,
     ):
         if table_column_values_sql:
             logger.debug(table_column_values_sql)
             try:
                 async for data in self._src_database.get_iter(table_column_values_sql,
                                                               chunk_size=BaseCollector.CHUNK_SIZE):
-                    await table_column_values.insert(data)
+                    await table_column_values.insert([i for i in data if i is not None])
 
             except (asyncpg.PostgresSyntaxError, asyncpg.UndefinedColumnError) as e:
                 logger.warning(
@@ -90,15 +90,15 @@ class BaseCollector(metaclass=ABCMeta):
         primary_key_values: Iterable[Union[int, str]] = (),
         where_conditions_columns: Optional[Dict[str, Iterable[Union[int, str]]]] = None,  # noqa
         is_revert=False,
-    ) -> StorageDataTable:
+    ) -> AbstractStorage:
         # если таблица находится в исключенных, то ее записи не нужно
         # импортировать
         try:
             if column.constraint_table.name in EXCLUDED_TABLES:
-                return StorageDataTable()
+                return create_storage()
         except AttributeError as e:
             logger.warning(f"{str(e)} --- _get_table_column_values")
-            return StorageDataTable()
+            return create_storage()
 
         # формирование запроса на получения идентификаторов записей
         # внешней таблицы
@@ -111,7 +111,7 @@ class BaseCollector(metaclass=ABCMeta):
             is_revert=is_revert,
         )
 
-        table_column_values = StorageDataTable()
+        table_column_values = create_storage()
 
         for table_column_values_sql in table_column_values_sql_list:
             sql_query_hash = hash(table_column_values_sql)
@@ -407,11 +407,12 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
                     stack_tables=stack_tables,
                 )
 
-                await self._direct_recursively_preparing_table(
-                    table=revert_table,
-                    need_transfer_pks=await revert_table.need_transfer_pks.all(),
-                    stack_tables=stack_tables_copy,
-                )
+                async for chunk in revert_table.need_transfer_pks:
+                    await self._direct_recursively_preparing_table(
+                        table=revert_table,
+                        need_transfer_pks=chunk,
+                        stack_tables=stack_tables_copy,
+                    )
 
         del need_transfer_pks
         del stack_tables
@@ -439,12 +440,13 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
                 revert_table in stack_tables or
                 revert_table.is_ready_for_transferring
             ):
-                await self._revert_recursively_preparing_revert_table(
-                    revert_table=revert_table,
-                    revert_columns=revert_columns,
-                    need_transfer_pks=await table.need_transfer_pks.all(),
-                    stack_tables=stack_tables,
-                )
+                async for chunk in table.need_transfer_pks:
+                    await self._revert_recursively_preparing_revert_table(
+                        revert_table=revert_table,
+                        revert_columns=revert_columns,
+                        need_transfer_pks=chunk,
+                        stack_tables=stack_tables,
+                    )
 
         table.is_checked = True
 

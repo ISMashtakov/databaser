@@ -139,3 +139,7 @@ if not any(
 VALIDATE_DATA_BEFORE_TRANSFERRING = get_bool_environ_parameter(
     name='VALIDATE_DATA_BEFORE_TRANSFERRING',
 )
+
+USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES = get_bool_environ_parameter(
+    name='USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES', default=False
+)

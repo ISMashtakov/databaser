@@ -28,7 +28,7 @@ from databaser.core.collectors import (
 from databaser.core.db_entities import (
     DBTable,
     DstDatabase,
-    SrcDatabase, StorageDataTable,
+    SrcDatabase,
 )
 from databaser.core.enums import (
     StagesEnum,
@@ -45,6 +45,7 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.storages import StorageDataTable, create_storage
 from databaser.core.transporters import (
     Transporter,
 )
@@ -71,7 +72,7 @@ from databaser.settings import (
     SRC_DB_PORT,
     SRC_DB_SCHEMA,
     SRC_DB_USER,
-    TEST_MODE,
+    TEST_MODE, USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES,
 )
 
 
@@ -258,17 +259,8 @@ class DatabaserManager:
             ) as src_pool:
                 self._src_database.connection_pool = src_pool
                 self._dst_database.connection_pool = dst_pool
-                await StorageDataTable.init_table(self._dst_database)
-
-                # a = StorageDataTable()
-                # await a.insert([1,2,3,4,5,6,7,8,9,19])
-                # b = StorageDataTable()
-                # await b.insert([2,3,4,5,11,23])
-                #
-                # async for i in a.iter_difference(b):
-                #     print(i)
-                #
-                # return
+                if USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES:
+                    await StorageDataTable.init_table(self._dst_database)
 
                 await self._src_database.prepare_table_names()
 
@@ -342,7 +334,9 @@ class DatabaserManager:
 
                 self._statistic_manager.print_stages_indications()
                 await self._statistic_manager.print_records_transfer_statistic()
-                await StorageDataTable.drop_table()
+
+                if USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES:
+                    await StorageDataTable.drop_table()
 
                 if TEST_MODE:
                     validator_manager = ValidatorManager(

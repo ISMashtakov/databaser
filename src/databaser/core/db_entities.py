@@ -32,6 +32,7 @@ from databaser.core.helpers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
+from databaser.core.storages import create_storage, AbstractStorage
 from databaser.core.strings import (
     CONNECTION_STR_TEMPLATE,
 )
@@ -442,7 +443,7 @@ class DBTable(object):
         )
 
         # Pks of table for transferring
-        self.need_transfer_pks = StorageDataTable()
+        self.need_transfer_pks = create_storage()
 
         self.transferred_pks_count = 0
 
@@ -648,7 +649,7 @@ class DBTable(object):
         """
         Updating table need transfer pks
         """
-        if isinstance(need_transfer_pks, StorageDataTable):
+        if isinstance(need_transfer_pks, AbstractStorage):
             await self.need_transfer_pks.add_storage_data(need_transfer_pks)
         else:
             await self.need_transfer_pks.insert(need_transfer_pks)
@@ -866,115 +867,3 @@ class DBColumn(object):
 
     async def add_constraint_type(self, constraint_type):
         self.constraint_type.append(constraint_type)
-
-
-##############
-
-
-CREATE_TABLE_SQL = """
-    CREATE TABLE storage_data (
-        group_id INTEGER,
-        data VARCHAR(255),
-        CONSTRAINT UC_VALUE UNIQUE (group_id,data)
-);
-
-CREATE INDEX group_idx ON storage_data (group_id);
-"""
-
-DROP_TABLE_SQL = """DROP TABLE IF EXISTS storage_data;"""
-
-INSERT_DATA_SQL_TEMPLATE = """
-    INSERT INTO storage_data (group_id, data)
-    VALUES {values}
-    ON CONFLICT DO NOTHING;
-"""
-
-DELETE_DATA_SQL_TEMPLATE = """
-    DELETE FROM storage_data
-    WHERE group_id = '{group}';
-"""
-
-IS_EXIST_DATA_SQL_TEMPLATE = """SELECT EXISTS(SELECT * FROM storage_data WHERE group_id = '{group}') as exist;"""
-
-ALL_DATA_SQL_TEMPLATE = """SELECT data FROM storage_data WHERE group_id = '{group}' ORDER BY data;"""
-
-COUNT_DATA_SQL_TEMPLATE = """SELECT count(*) FROM storage_data WHERE group_id = '{group}';"""
-
-DIFFERENCE_DATA_SQL_TEMPLATE = """
-    SELECT data FROM storage_data WHERE group_id = '{group1}' AND data not in (
-        SELECT data FROM storage_data WHERE group_id = '{group2}'
-    ) ORDER BY data;
-"""
-
-COUNT_SQL_RESULT_TEMPLATE = """SELECT count(*) from {sql};"""
-
-
-class StorageDataTable:
-    CHUNK_SIZE = 30000
-    _last_group_number = 0
-    _dst_db: Optional[DstDatabase] = None
-
-    def __init__(self):
-        StorageDataTable._last_group_number += 1
-        self._have_value = False
-        self._group = StorageDataTable._last_group_number
-
-    @staticmethod
-    async def init_table(dst_db: DstDatabase):
-        StorageDataTable._dst_db = dst_db
-        await StorageDataTable.drop_table()
-        await StorageDataTable._dst_db.execute_raw_sql(CREATE_TABLE_SQL)
-
-    @staticmethod
-    async def drop_table():
-        await StorageDataTable._dst_db.execute_raw_sql(DROP_TABLE_SQL)
-
-    async def delete(self):
-        delete_data_sql = DELETE_DATA_SQL_TEMPLATE.format(group=self._group)
-        await StorageDataTable._dst_db.execute_raw_sql(delete_data_sql)
-
-    def __aiter__(self) -> AsyncIterator[List[str]]:
-        all_sql = ALL_DATA_SQL_TEMPLATE.format(group=self._group)
-        return self._dst_db.get_iter(all_sql, self.CHUNK_SIZE)
-
-    async def insert(self, data: Iterable[Union[int, str]]):
-        if not data:
-            return
-
-        insert_data_sql = INSERT_DATA_SQL_TEMPLATE.format(
-            values=', '.join([str((self._group, i)) for i in data])
-        )
-        await StorageDataTable._dst_db.execute_raw_sql(insert_data_sql)
-
-    async def add_storage_data(self, storage_data: 'StorageDataTable'):
-        async for chunk in storage_data:
-            await self.insert(chunk)
-
-    async def is_not_empty(self) -> bool:
-        if not self._have_value:
-            is_exist_sql = IS_EXIST_DATA_SQL_TEMPLATE.format(group=self._group)
-
-            result = await StorageDataTable._dst_db.fetch_raw_sql(is_exist_sql)
-
-            self._have_value = result[0][0]
-
-        return self._have_value
-
-    async def all(self) -> list[str]:
-        all_data_sql = ALL_DATA_SQL_TEMPLATE.format(group=self._group)
-
-        result = await StorageDataTable._dst_db.fetch_raw_sql(all_data_sql)
-
-        return [i[0] for i in result]
-
-    async def len(self) -> int:
-        count_data_sql = COUNT_DATA_SQL_TEMPLATE.format(group=self._group)
-
-        result = await StorageDataTable._dst_db.fetch_raw_sql(count_data_sql)
-
-        return result[0][0]
-
-    def iter_difference(self, other: 'StorageDataTable') -> AsyncIterator[List[str]]:
-        data_sql = DIFFERENCE_DATA_SQL_TEMPLATE.format(group1=self._group, group2=other._group)
-
-        return self._dst_db.get_iter(data_sql, self.CHUNK_SIZE)
