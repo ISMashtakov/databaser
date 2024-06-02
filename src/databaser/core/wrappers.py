@@ -11,7 +11,6 @@ from databaser.core.db_entities import (
 from databaser.core.repositories import (
     SQLRepository,
 )
-from databaser.core.tsts import get_acquire
 
 
 class PostgresFDWExtensionWrapper:

@@ -32,7 +32,6 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
-from databaser.core.tsts import get_acquire
 
 
 class Transporter:
@@ -98,20 +97,18 @@ class Transporter:
 
         logger.info(f'transfer chunk table data - "{table.name}"')
 
-        transferred_ids = None
-        async with self._dst_database.connection_pool.acquire() as connection:
-            try:
-                transferred_ids = await connection.fetch(transfer_sql)
-            except (
-                UndefinedColumnError,
-                NotNullViolationError,
-                PostgresSyntaxError,
-                NumericValueOutOfRangeError,
-            ) as e:
-                raise PostgresError(
-                    f'{str(e)}, table - {table.name}, '
-                    f'sql - {transfer_sql} --- _transfer_chunk_table_data'
-                )
+        try:
+            transferred_ids = await self._dst_database.fetch_raw_sql(transfer_sql)
+        except (
+            UndefinedColumnError,
+            NotNullViolationError,
+            PostgresSyntaxError,
+            NumericValueOutOfRangeError,
+        ) as e:
+            raise PostgresError(
+                f'{str(e)}, table - {table.name}, '
+                f'sql - {transfer_sql} --- _transfer_chunk_table_data'
+            )
 
         if transferred_ids:
             table.transferred_pks_count += len(transferred_ids)

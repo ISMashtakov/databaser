@@ -39,7 +39,6 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
-from databaser.core.tsts import get_acquire
 from databaser.settings import (
     EXCLUDED_TABLES,
     FULL_TRANSFER_TABLES,
