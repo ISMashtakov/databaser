@@ -2,15 +2,13 @@ from abc import ABC
 from typing import AsyncIterator, List, Iterable, Union, Optional, Set
 
 from databaser.core.helpers import make_chunks
-from databaser.settings import USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES
+from databaser.settings import USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES, COLLECTOR_CHUNK_SIZE
 
 
 class AbstractStorage(ABC):
     """
     Абстрактный Класс хранилище id записей
     """
-
-    CHUNK_SIZE = 3000000
 
     async def delete(self):
         """
@@ -109,8 +107,6 @@ class StorageDataTable(AbstractStorage):
         ) ORDER BY data;
     """
 
-    COUNT_SQL_RESULT_TEMPLATE = """SELECT count(*) from {sql};"""
-
     _last_group_number = 0
     _dst_db: Optional["DstDatabase"] = None
 
@@ -136,7 +132,7 @@ class StorageDataTable(AbstractStorage):
 
     def __aiter__(self) -> AsyncIterator[List[str]]:
         all_sql = StorageDataTable.ALL_DATA_SQL_TEMPLATE.format(group=self._group)
-        return self._dst_db.get_iter(all_sql, self.CHUNK_SIZE)
+        return self._dst_db.get_iter(all_sql, COLLECTOR_CHUNK_SIZE)
 
     async def insert(self, data: Iterable[Union[int, str]]):
         if not data:
@@ -171,7 +167,7 @@ class StorageDataTable(AbstractStorage):
     def iter_difference(self, other: 'StorageDataTable') -> AsyncIterator[List[str]]:
         data_sql = StorageDataTable.DIFFERENCE_DATA_SQL_TEMPLATE.format(group1=self._group, group2=other._group)
 
-        return self._dst_db.get_iter(data_sql, self.CHUNK_SIZE)
+        return self._dst_db.get_iter(data_sql, COLLECTOR_CHUNK_SIZE)
 
     async def all(self) -> list[str]:
         all_data_sql = StorageDataTable.ALL_DATA_SQL_TEMPLATE.format(group=self._group)
@@ -194,7 +190,7 @@ class StorageList(AbstractStorage):
 
     def __aiter__(self) -> AsyncIterator[List[str]]:
         async def iterator():
-            for i in make_chunks(self._storage, self.CHUNK_SIZE):
+            for i in make_chunks(self._storage, COLLECTOR_CHUNK_SIZE):
                 yield list(i)
 
         return iterator()
@@ -218,7 +214,7 @@ class StorageList(AbstractStorage):
         data = self._storage - other._storage
 
         async def iterator():
-            for i in make_chunks(data, self.CHUNK_SIZE):
+            for i in make_chunks(data, COLLECTOR_CHUNK_SIZE):
                 yield list(i)
 
         return iterator()

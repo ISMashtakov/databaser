@@ -1,4 +1,3 @@
-import asyncio
 from typing import (
     List,
     Set,
@@ -10,7 +9,7 @@ from asyncpg import (
     NumericValueOutOfRangeError,
     PostgresError,
     PostgresSyntaxError,
-    UndefinedColumnError, Connection,
+    UndefinedColumnError,
 )
 
 from databaser.core.db_entities import (
@@ -23,7 +22,7 @@ from databaser.core.enums import (
 )
 from databaser.core.helpers import (
     logger,
-    make_chunks,
+    execute_async_function_for_collection,
 )
 from databaser.core.loggers import (
     StatisticManager,
@@ -39,7 +38,6 @@ class Transporter:
     Класс комплексной транспортировки, который использует принципы обхода по
     внешним ключам и по таблицам с обратной связью
     """
-    CHUNK_SIZE = 3000000
 
     def __init__(
         self,
@@ -123,13 +121,7 @@ class Transporter:
             table for table in self._dst_database.tables.values() if await table.need_transfer_pks.is_not_empty()
         ]
 
-        coroutines = [
-            self._transfer_table_data(table)
-            for table in need_imported_tables
-        ]
-
-        if coroutines:
-            await asyncio.gather(*coroutines)
+        await execute_async_function_for_collection(self._transfer_table_data, need_imported_tables)
 
         logger.info("finished transferring data to target db!")
 

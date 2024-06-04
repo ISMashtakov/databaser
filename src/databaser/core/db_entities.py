@@ -27,7 +27,7 @@ from databaser.core.helpers import (
     deep_getattr,
     logger,
     make_chunks,
-    make_str_from_iterable,
+    make_str_from_iterable, execute_async_function_for_collection,
 )
 from databaser.core.repositories import (
     SQLRepository,
@@ -124,10 +124,8 @@ class BaseDatabase(object):
         """
         Async executing raw sql
         """
-        logger.info(f"prepare execute raw sql {raw_sql[:150]}...{raw_sql[-50:]}")
         async with self.connection_pool.acquire() as connection:
             await connection.execute(raw_sql)
-        logger.info(f"after execute raw sql {raw_sql[:150]}...{raw_sql[-50:]}")
 
     async def fetch_raw_sql(
         self,
@@ -136,21 +134,24 @@ class BaseDatabase(object):
         """
         Async executing raw sql with fetching result
         """
-        logger.info(f"prepare fetch_raw_sql {raw_sql[:150]}...{raw_sql[-150:]}")
         async with self.connection_pool.acquire() as connection:
             result = await connection.fetch(raw_sql)
-        logger.info(f"after fetch_raw_sql {raw_sql[:150]}...{raw_sql[-150:]}")
         return result
 
     def get_iter(self, sql: str, chunk_size: int) -> AsyncIterator[List[str]]:
+        """
+        Возвращает асинхронный итератор для итерации по результату sql запроса.
+        На каждом шаге возвращается список записей размером chunk_size.
+        """
+
         step = 0
-        LIMIT_OFFSET_SQL_TEMPLATE = """{sql} LIMIT {limit} OFFSET {offset};"""
+        limit_offset_sql_template = """{sql} LIMIT {limit} OFFSET {offset};"""
 
         async def iterator():
             nonlocal step
 
             while True:
-                step_sql = LIMIT_OFFSET_SQL_TEMPLATE.format(
+                step_sql = limit_offset_sql_template.format(
                     sql=sql.replace(';', ''),
                     limit=chunk_size,
                     offset=chunk_size * step
@@ -318,14 +319,8 @@ class DstDatabase(BaseDatabase):
         """
         Setting max table sequence value as max(id) + 1
         """
-        coroutines = [
-            asyncio.create_task(
-                table.set_max_sequence(self._connection_pool)
-            )
-            for table in self.tables.values()
-        ]
-
-        await asyncio.wait(coroutines)
+        for table in self.tables.values():
+            await table.set_max_sequence(self._connection_pool)
 
     async def prepare_structure(self):
         """
@@ -453,7 +448,6 @@ class DBTable(object):
             f'@with_fk="{self.with_fk}" '
             f'@with_key_column="{self.with_key_column}" '
             f'@with_self_fk="{self.with_self_fk}" '
-            #f'@need_transfer_pks_count="{len(self.need_transfer_pks)}" >'
         )
 
     def __str__(self):
@@ -492,15 +486,18 @@ class DBTable(object):
         self._is_ready_for_transferring = is_ready_for_transferring
 
     async def is_full_prepared(self):
+        need_transfer_pks_len = await self.need_transfer_pks.len()
         logger.debug(
             f'table - {self.name} -- count table records {self.full_count} and '
-            f'need transfer pks {await self.need_transfer_pks.len()}'
+            f'need transfer pks {need_transfer_pks_len}'
         )
 
-        if await self.need_transfer_pks.len() >= self.full_count - self.inaccuracy_count:  # noqa
-            logger.info(f'table {self.name} full transferred')
+        if need_transfer_pks_len >= self.full_count - self.inaccuracy_count:  # noqa
+            logger.info(f'table {self.name} full prepared')
 
             return True
+
+        return False
 
     @property
     @lru_cache()

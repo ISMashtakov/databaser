@@ -36,7 +36,7 @@ from databaser.core.enums import (
 from databaser.core.helpers import (
     DBConnectionParameters,
     logger,
-    make_str_from_iterable,
+    make_str_from_iterable, execute_async_function_for_collection,
 )
 from databaser.core.loggers import (
     StatisticManager,
@@ -45,7 +45,7 @@ from databaser.core.loggers import (
 from databaser.core.repositories import (
     SQLRepository,
 )
-from databaser.core.storages import StorageDataTable, create_storage
+from databaser.core.storages import StorageDataTable
 from databaser.core.transporters import (
     Transporter,
 )
@@ -174,11 +174,12 @@ class DatabaserManager:
         )
 
         if hierarchy_column:
-            for key_column_value in copy(self._key_column_values):
+            async def partial_getting(value: int):
                 await self._get_key_table_parents_values(
-                        key_table_primary_key_name=key_table.primary_key.name,
-                        key_table_primary_key_value=key_column_value,
-                    )
+                    key_table_primary_key_name=key_table.primary_key.name,
+                    key_table_primary_key_value=value
+                )
+            await execute_async_function_for_collection(partial_getting, copy(self._key_column_values))
 
         logger.info(
             f"transferring enterprises - "
@@ -250,15 +251,16 @@ class DatabaserManager:
         async with asyncpg.create_pool(
             self._dst_database.connection_str,
             min_size=10,
-            max_size=30,
+            max_size=20,
         ) as dst_pool:
             async with asyncpg.create_pool(
                 self._src_database.connection_str,
-                min_size=10,
-                max_size=30,
+                min_size=30,
+                max_size=40,
             ) as src_pool:
                 self._src_database.connection_pool = src_pool
                 self._dst_database.connection_pool = dst_pool
+
                 if USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES:
                     await StorageDataTable.init_table(self._dst_database)
 
@@ -391,7 +393,6 @@ class CollectorManager:
 
     async def manage(self):
         for collector_class in self.collectors_classes:
-            print(f"start {collector_class.__name__}")
             collector = collector_class(
                 src_database=self._src_database,
                 dst_database=self._dst_database,
