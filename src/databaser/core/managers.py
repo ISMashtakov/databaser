@@ -250,8 +250,8 @@ class DatabaserManager:
         """
         async with asyncpg.create_pool(
             self._dst_database.connection_str,
-            min_size=10,
-            max_size=20,
+            min_size=30,
+            max_size=40,
         ) as dst_pool:
             async with asyncpg.create_pool(
                 self._src_database.connection_str,

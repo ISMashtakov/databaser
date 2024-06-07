@@ -133,7 +133,7 @@ USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES = get_bool_environ_parameter(
 )
 
 COLLECTOR_CHUNK_SIZE = get_int_environ_parameter(
-    name='DATABASER_COLLECTOR_CHUNK_SIZE', default=30000
+    name='DATABASER_COLLECTOR_CHUNK_SIZE', default=60000
 )
 
 ASYNC_SEPARATION_COEFFICIENT = get_int_environ_parameter(
