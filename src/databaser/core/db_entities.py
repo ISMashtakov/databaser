@@ -163,7 +163,7 @@ class BaseDatabase(object):
                 async with self.connection_pool.acquire() as connection:
                     result = await connection.fetch(raw_sql, timeout=240)
                     break
-            except (CannotConnectNowError, asyncio.TimeoutError):
+            except (CannotConnectNowError, asyncio.TimeoutError, ConnectionDoesNotExistError):
                 await asyncio.sleep(20)
         else:
             raise CannotConnectNowError
