@@ -60,7 +60,11 @@ class Transporter:
     async def _transfer_table_data(self, table: DBTable):
         """
         Перенос данных таблицы
+
+        Args:
+            table: Таблица для переноса
         """
+
         logger.info(
             f"start transferring table \"{table.name}\", "
             f"need to import - {await table.need_transfer_pks.len()}"
@@ -86,7 +90,12 @@ class Transporter:
     ):
         """
         Порционный перенос данных таблицы в целевую БД
+
+        Args:
+            table: Таблица для переноса
+            need_import_ids_chunk: Часть id строк для переноса
         """
+
         transfer_sql = SQLRepository.get_transfer_records_sql(
             table=table,
             connection_params_str=self._src_database.connection_str,
@@ -115,6 +124,7 @@ class Transporter:
         """
         Физический импорт данных в целевую БД из БД-донора
         """
+
         logger.info("start transferring data to target db...")
 
         need_imported_tables = [
@@ -129,6 +139,7 @@ class Transporter:
         """
         Обновление значений счетчиков на макситальные
         """
+
         logger.info("start updating sequences...")
         await self._dst_database.set_max_tables_sequences()
         logger.info("finished updating sequences!")
@@ -137,6 +148,7 @@ class Transporter:
         """
         Переносит данный из БД донора в БД приемник
         """
+
         async with statistic_indexer(
             self._statistic_manager,
             StagesEnum.TRANSFERRING_COLLECTED_DATA

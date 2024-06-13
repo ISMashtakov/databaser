@@ -164,8 +164,9 @@ class DatabaserManager:
 
     async def _build_key_column_values_hierarchical_structure(self):
         """
-        Building tree of hierarchy key table records by parent_id column
+        Построение дерева иерархии записей ключвой таблицы по parent_id столбцу
         """
+
         logger.info("build tree of enterprises for transfer process")
 
         key_table: DBTable = self._dst_database.tables.get(KEY_TABLE_NAME)
@@ -188,8 +189,9 @@ class DatabaserManager:
 
     async def _set_table_counters(self, table_name: str):
         """
-        Filling table max pk and count of records
+        Заполнение максимального pk и количество записей
         """
+
         async with self._src_database.connection_pool.acquire() as connection:
             table = self._dst_database.tables[table_name]
             if table.primary_key is None:
@@ -246,8 +248,9 @@ class DatabaserManager:
 
     async def _main(self):
         """
-        Run async databaser
+        Запуск асинхронного Databaser
         """
+
         async with asyncpg.create_pool(
             self._dst_database.connection_str,
             min_size=30,

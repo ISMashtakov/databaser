@@ -11,7 +11,7 @@ from typing import (
     Iterable,
     Optional,
     Set,
-    Union, List,
+    Union,
 )
 
 import asyncpg
@@ -68,6 +68,14 @@ class BaseCollector(metaclass=ABCMeta):
             table_column_values_sql: str,
             table_column_values: AbstractStorage,
     ):
+        """
+        Добавляет в хранилище результат sql запроса
+
+        Args:
+            table_column_values_sql: sql запрос
+            table_column_values: Хранилище для заполнения
+        """
+
         if table_column_values_sql:
             logger.debug(table_column_values_sql)
             try:
@@ -89,48 +97,63 @@ class BaseCollector(metaclass=ABCMeta):
             where_conditions_columns: Optional[Dict[str, Iterable[Union[int, str]]]] = None,  # noqa
             is_revert=False,
     ) -> AbstractStorage:
+        """
+        Возвращает данные столбца для указанных строк
+
+        Args:
+            table: Таблица, для которой получаем данные
+            column: Столбец
+            primary_key_values: Id строк, для которых получаем значения
+            where_conditions_columns: Дополнительные условия фильтрации
+            is_revert: является ли column внешним ключом на table
+        Returns:
+            Хранилище с результатами. Если таблица в списке исключённых, то хранилище будет пустым
+        """
+
+        result = create_storage()
+        in_excluded = False
+
         # если таблица находится в исключенных, то ее записи не нужно
         # импортировать
         try:
             if column.constraint_table.name in EXCLUDED_TABLES:
-                return create_storage()
+                in_excluded = True
         except AttributeError as e:
             logger.warning(f"{str(e)} --- _get_table_column_values")
-            return create_storage()
+            in_excluded = True
 
-        # формирование запроса на получения идентификаторов записей
-        # внешней таблицы
-        table_column_values_sql_list = await SQLRepository.get_table_column_values_sql(
-            table=table,
-            column=column,
-            key_column_values=self._key_column_values,
-            primary_key_values=primary_key_values,
-            where_conditions_columns=where_conditions_columns,
-            is_revert=is_revert,
-        )
+        if not in_excluded:
+            # формирование запроса на получения идентификаторов записей
+            # внешней таблицы
+            table_column_values_sql_list = await SQLRepository.get_table_column_values_sql(
+                table=table,
+                column=column,
+                key_column_values=self._key_column_values,
+                primary_key_values=primary_key_values,
+                where_conditions_columns=where_conditions_columns,
+                is_revert=is_revert,
+            )
 
-        table_column_values = create_storage()
+            for table_column_values_sql in table_column_values_sql_list:
+                sql_query_hash = hash(table_column_values_sql)
 
-        for table_column_values_sql in table_column_values_sql_list:
-            sql_query_hash = hash(table_column_values_sql)
+                if sql_query_hash not in self.__class__.QUERY_HASHES:
+                    BaseCollector.QUERY_HASHES.add(sql_query_hash)
+                    try:
+                        await self._get_table_column_values_part(
+                            table_column_values_sql=table_column_values_sql,
+                            table_column_values=result,
+                        )
+                    except DatetimeFieldOverflowError as e:
+                        logger.warning(f"Failed to get table column value {table.name}: {e}")
+                        break
 
-            if sql_query_hash not in self.__class__.QUERY_HASHES:
-                BaseCollector.QUERY_HASHES.add(sql_query_hash)
-                try:
-                    await self._get_table_column_values_part(
-                        table_column_values_sql=table_column_values_sql,
-                        table_column_values=table_column_values,
-                    )
-                except DatetimeFieldOverflowError as e:
-                    logger.warning(f"Failed to get table column value {table.name}: {e}")
-                    break
-
-        return table_column_values
+        return result
 
     @abstractmethod
     def collect(self):
         """
-        Run collecting tables records for transferring
+        Запускает подготовку записей для переноса
         """
 
 
@@ -140,6 +163,10 @@ class KeyTableCollector(BaseCollector):
     """
 
     async def _prepare_key_table_values(self):
+        """
+        Подготавливает к переносу ключевую таблицу
+        """
+
         logger.info('prepare key table values...')
 
         key_table = self._dst_database.tables[KEY_TABLE_NAME]
@@ -163,8 +190,12 @@ class FullTransferCollector(BaseCollector):
 
     async def _prepare_full_transfer_table(self, table: DBTable):
         """
-        Обработка таблицы с полным переносом записей таблицы
+        Обработка таблицы с полным переносом записей
+
+        Args:
+            table: таблица для полного переноса
         """
+
         logger.info(
             f'start preparing full transfer table "{table.name}"'
         )
@@ -220,8 +251,16 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             stack_tables: Set[DBTable],
     ):
         """
-        Direct recursively preparing foreign table chunk
+        Рекурсивное получение и обработка части записей из таблицы
+        Если в таблице имеется ссылка на ключевую таблицу, то фильтрация происходит по ней, игнорируя переданные id
+
+        Args:
+            table: Таблица, для которой получаем данные
+            column: Столбец
+            need_transfer_pks_chunk: Id строк, для которых получаем значения
+            stack_tables: Набор таблиц в рекурсии над которыми ведётся работа
         """
+
         foreign_table = column.constraint_table
         foreign_table.is_checked = True
 
@@ -269,8 +308,15 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             stack_tables: Set[DBTable],
     ):
         """
-        Recursively preparing foreign table
+        Рекурсивное получение и обработка части записей из таблицы с разбитием на чанки
+
+        Args:
+            table: Таблица, для которой получаем данные
+            column: Столбец
+            need_transfer_pks: Id строк, для которых получаем значения
+            stack_tables: Набор таблиц в рекурсии над которыми ведётся работа
         """
+
         need_transfer_pks_chunks = make_chunks(
             iterable=need_transfer_pks,
             size=COLLECTOR_CHUNK_SIZE,
@@ -293,8 +339,16 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             stack_tables: Optional[Set[DBTable]] = None,
     ):
         """
-        Recursively preparing table
+        Рекурсивное получение и обработка части записей из таблицы.
+        При этом идёт обработка таблиц, которые ссылаются на полученные данные,
+        и таблиц на которые ссылаются полученные данные
+
+        Args:
+            table: Таблица, для которой получаем данные
+            need_transfer_pks: Id строк, для которых получаем значения
+            stack_tables: Набор таблиц в рекурсии над которыми ведётся работа
         """
+
         if stack_tables is None:
             stack_tables = set()
 
@@ -344,8 +398,14 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             need_transfer_pks_chunk: Iterable[Union[int, str]],
     ):
         """
-        Recursively preparing revert table column chunk
+        Рекурсивное получение и обработка части записей из таблицы
+
+         Args:
+            revert_table: Таблица, для которой получаем данные
+            revert_column: Столбец, ссылающийся на ранее обрабатываемую таблицу
+            need_transfer_pks_chunk: Значения столбца, для которых получаем значения
         """
+
         where_conditions_columns = {
             revert_column.name: need_transfer_pks_chunk,
         }
@@ -371,8 +431,14 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             need_transfer_pks: Iterable[Union[int, str]],
     ):
         """
-        Recursively preparing revert table column
+        Рекурсивное получение и обработка части записей из таблицы с разбитием на чанки
+
+        Args:
+            revert_table: Таблица, для которой получаем данные
+            revert_column: Столбец, ссылающийся на ранее обрабатываемую таблицу
+            need_transfer_pks: Значения столбца, для которых получаем значения
         """
+
         need_transfer_pks_chunks = make_chunks(
             iterable=need_transfer_pks,
             size=COLLECTOR_CHUNK_SIZE,
@@ -396,8 +462,15 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             stack_tables: Set[DBTable],
     ):
         """
-        Recursively preparing revert table
+        Обработка таблиц ссылающихся на ранее обрабатываемую таблицу
+
+        Args:
+            revert_table: Таблица
+            revert_columns: Столбец ссылающийся на ранее обрабатываемую таблицу
+            need_transfer_pks: Значения столбца для получения строк
+            stack_tables: Набор таблиц в рекурсии над которыми ведётся работа
         """
+
         if need_transfer_pks:
             async def partial_preparing(column: DBColumn):
                 await self._revert_recursively_preparing_revert_table_column(
@@ -437,8 +510,13 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             stack_tables: Optional[Set[DBTable]] = None,
     ):
         """
-        Revert recursively preparing table
+        Обработка таблиц ссылающихся на переданную
+
+        Args:
+            table: Таблица
+            stack_tables: Набор таблиц в рекурсии над которыми ведётся работа
         """
+
         if stack_tables is None:
             stack_tables = set()
 
@@ -470,8 +548,12 @@ class TablesWithKeyColumnSiblingsCollector(BaseCollector):
             table: DBTable,
     ):
         """
-        Preparing tables with key column and siblings
+        Подготовка таблицы со ссылкой на ключевую таблицу и рекурсивная подготовка связанных данных
+
+        Args:
+             table: Таблица
         """
+
         logger.info(
             f'start preparing table with key column "{table.name}"'
         )
@@ -536,7 +618,12 @@ class SortedByDependencyTablesCollector(BaseCollector):
             revert_column: DBColumn,
     ):
         """
-        Get revert table column values
+        Обработка таблицы ссылающийся на текущую таблицу
+
+        Args:
+            table: Текущая таблица
+            revert_table: Таблица, которая ссылается на текущую
+            revert_column: Столбец со ссылкой на текущую таблицу
         """
 
         async def update_chunk_of_pks(chunk):
@@ -561,8 +648,15 @@ class SortedByDependencyTablesCollector(BaseCollector):
             revert_columns: Set[DBColumn],
     ):
         """
-        Preparing revert table
+        Обработка таблицы ссылающийся на текущую таблицу
+
+        Args:
+            table: Текущая таблица
+            revert_table: Таблица, которая ссылается на текущую
+            revert_columns: Столбцы со ссылкой на текущую таблицу
+
         """
+
         logger.info(f'prepare revert table {revert_table.name}')
 
         if (
@@ -586,8 +680,12 @@ class SortedByDependencyTablesCollector(BaseCollector):
             table: DBTable,
     ):
         """
-        Preparing table records for transferring
+        Обрабатывает таблицу не имеющей связи ссылками с ключевой
+
+        Args:
+             table: Таблица
         """
+
         logger.info(
             f'start preparing table "{table.name}"'
         )
@@ -754,6 +852,7 @@ class GenericTablesCollector(BaseCollector):
         """
         Подготавливает соответствие content_type_id и наименование таблицы в БД
         """
+
         logger.info("prepare content type tables")
 
         content_type_table_list = await self._dst_database.fetch_raw_sql(
@@ -830,6 +929,7 @@ class GenericTablesCollector(BaseCollector):
         """
         Перенос данных из таблицы, содержащей generic foreign key
         """
+
         logger.info(f"prepare generic table data {target_table.name}")
 
         async def partial_preparing(table_name: str):
@@ -844,6 +944,7 @@ class GenericTablesCollector(BaseCollector):
         Собирает идентификаторы записей таблиц, содержащих generic key
         Предполагается, что такие таблицы имеют поля object_id и content_type_id
         """
+
         logger.info("collect generic tables records ids")
 
         await asyncio.wait(

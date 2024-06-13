@@ -20,6 +20,9 @@ class AbstractStorage(ABC):
     async def __aiter__(self) -> AsyncIterator[List[str]]:
         """
         Итератор по бачам записей
+
+        Returns:
+            Итератор
         """
 
         raise NotImplementedError
@@ -27,6 +30,9 @@ class AbstractStorage(ABC):
     async def insert(self, data: Iterable[Union[int, str]]):
         """
         Добавление в хранилище данных
+
+        Args:
+            data: данные для добавления
         """
 
         raise NotImplementedError
@@ -34,6 +40,9 @@ class AbstractStorage(ABC):
     async def add_storage_data(self, storage_data: 'AbstractStorage'):
         """
         Копирование в хранилище данных из другого хранилища
+
+        Args:
+            storage_data: хранилище с данными для копирования
         """
 
         raise NotImplementedError
@@ -41,6 +50,9 @@ class AbstractStorage(ABC):
     async def is_not_empty(self) -> bool:
         """
         Проверка, что хранилище не пустое
+
+        Returns:
+            True, если хранилище пустое, инчае False
         """
 
         raise NotImplementedError
@@ -48,6 +60,9 @@ class AbstractStorage(ABC):
     async def len(self) -> int:
         """
         Получение количества элементов в хранилище
+
+        Returns:
+            Размер хранилища
         """
 
         raise NotImplementedError
@@ -55,6 +70,11 @@ class AbstractStorage(ABC):
     def iter_difference(self, other: 'AbstractStorage') -> AsyncIterator[List[str]]:
         """
         Итератор по элементам, которых нет в другом хранилище
+
+        Args:
+            other: Другое хранилище
+        Returns:
+            Итератор по бачам
         """
 
         raise NotImplementedError
@@ -62,6 +82,9 @@ class AbstractStorage(ABC):
     async def all(self) -> List[str]:
         """
         Возвращение всех элементов хранилища
+
+        Returns:
+            Список всех элементов хранилища
         """
 
         raise NotImplementedError
@@ -117,12 +140,23 @@ class StorageDataTable(AbstractStorage):
 
     @staticmethod
     async def init_table(dst_db: "DstDatabase"):
+        """
+        Создание таблицы для хранения временных данных в целевой бд
+
+        Args:
+            dst_db: Целевая бд
+        """
+
         StorageDataTable._dst_db = dst_db
         await StorageDataTable.drop_table()
         await StorageDataTable._dst_db.execute_raw_sql(StorageDataTable.CREATE_TABLE_SQL)
 
     @staticmethod
     async def drop_table():
+        """
+        Удаление таблицы для хранения временных данных из целевой бд
+        """
+
         await StorageDataTable._dst_db.execute_raw_sql(StorageDataTable.DROP_TABLE_SQL)
 
     async def delete(self):
@@ -226,6 +260,9 @@ class StorageList(AbstractStorage):
 def create_storage() -> AbstractStorage:
     """
         Возвращает новое хранилище исходя из выбранных настроек
+
+        Returns:
+            Хранилище для данных
     """
 
     if USE_DATABASE_FOR_STORE_INTERMEDIATE_VALUES:

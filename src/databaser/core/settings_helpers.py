@@ -17,6 +17,7 @@ def get_str_environ_parameter(
     Returns:
         Полученное значение
     """
+
     return os.environ.get(name, default).strip()
 
 
@@ -34,6 +35,7 @@ def get_int_environ_parameter(
     Returns:
         Полученное значение
     """
+
     return int(os.environ.get(name, default))
 
 
@@ -51,6 +53,7 @@ def get_bool_environ_parameter(
     Returns:
         Полученное значение
     """
+
     parameter_value = os.environ.get(name)
 
     if parameter_value:
@@ -76,6 +79,7 @@ def get_iterable_environ_parameter(
     Returns:
         Полученное значение
     """
+
     return tuple(
         map(
             type_,
@@ -103,6 +107,7 @@ def get_extensible_iterable_environ_parameter(
     Returns:
         Полученное значение
     """
+
     return list(
         map(
             type_,
